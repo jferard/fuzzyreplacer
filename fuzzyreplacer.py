@@ -4,14 +4,16 @@
 
 import difflib
 import re
-from typing import Mapping, List, Union, Callable, Optional
+from typing import Mapping, List, Callable, Optional, Any, ItemsView
+
+
+Tree = Mapping[str, Optional["Tree"]]
 
 
 class Match:
     """
     A match
     """
-
     def __init__(self, i: int, j: int, s: str, score: float):
         """
 
@@ -27,16 +29,18 @@ class Match:
 
     def weighted_score(self) -> float:
         """
-        :return: the score weighted by the length of the match
+        :return: the score weighted of the match : len * score
         """
-        return self.score * (self.j - self.i)
+        return self.score * len(self)
 
     def __len__(self) -> int:
         return self.j - self.i
 
-    def __eq__(self, other) -> bool:
-        return isinstance(other,
-                          Match) and other.i == self.i and other.j == self.j and self.s == other.s
+    def __eq__(self, other: Any) -> bool:
+        return (
+                isinstance(other, Match)
+                and other.i == self.i and other.j == self.j and self.s == other.s
+        )
 
     def __repr__(self) -> str:
         return "Match({}:{}, {}, ws={})".format(self.i, self.j, self.s,
@@ -45,43 +49,41 @@ class Match:
 
 class State:
     """
-    Current state in the dict
+    Current state in the tree
     """
-
-    def __init__(self, i: int, d: Mapping[str, str], score: float):
+    def __init__(self, i: int, subtree: Tree, score: float):
         """
 
         :param i: the start of the match
-        :param d: the subtree of level 1
+        :param subtree: the subtree of level 1
         :param score: the score
         """
         self.i = i
-        self.d = d
+        self.subtree = subtree
         self.score = score
 
-    def items(self):
-        return self.d.items()
+    def items(self) -> ItemsView[str, Tree]:
+        return self.subtree.items()
 
     def as_match(self, j: int, s: str) -> "Match":
         """
-        :param j: last indec
+        :param j: last index
         :param s: the replacement
         :return: a match
         """
         return Match(self.i, j, s, self.score)
 
-    def update(self, v: Mapping[str, str], score: float):
+    def update(self, subtree: Tree, score: float):
         """
         Advance one step in the tree
-        :param v: the subtree
+        :param subtree: the subtree
         :param score: the next score
         """
-
-        assert v is not None
-        return State(self.i, v, self.score * score)
+        assert subtree is not None
+        return State(self.i, subtree, self.score * score)
 
     def __repr__(self) -> str:
-        return "State({}, {})".format(self.i, self.d)
+        return "State({}, {})".format(self.i, self.subtree)
 
 
 def select_matches(matches: List[Match]) -> List[Match]:
@@ -99,26 +101,31 @@ def select_matches(matches: List[Match]) -> List[Match]:
     for winner in matches[1:]:
         if winner.i == cur_winner.i and winner.weighted_score() > cur_winner.weighted_score():
             cur_winner = winner
-        elif winner.i >= cur_winner.j:
+        elif winner.i >= cur_winner.j:  # if the match doesn't overlap
             selected_matches.append(cur_winner)
             cur_winner = winner
     selected_matches.append(cur_winner)
     return selected_matches
 
 
-SPLIT_REGEX = re.compile(r"(\W+)")
-Tree = Union[Mapping[str, "Tree"], Mapping[str, None]]
+SPLIT_W_DELIM_REGEX = re.compile(r"(\W+)")
+SPLIT_WO_DELIM_REGEX = re.compile(r"\W+")
 
 
-def dict_to_tree(d: Mapping[str, str], func: Callable[[str], str]
-                 ) -> Tree:
+def dict_to_tree(
+        d: Mapping[str, str], func: Callable[[str], str]) -> Tree:
+    """
+    {"foo bar baz" : bat}
+    becomes
+    {"foo":{"bar":{"baz":{"bat: None}}}}
+    """
     root = {}
-    for k, v in d.items():
+    for key, value in d.items():
         cur = root
 
-        for chunk in k.split():
-            cur = cur.setdefault(func(chunk), {})
-        cur[v] = None
+        for key_chunk in SPLIT_WO_DELIM_REGEX.split(key):
+            cur = cur.setdefault(func(key_chunk), {})
+        cur[value] = None
     return root
 
 
@@ -126,7 +133,6 @@ class FuzzyReplacerHelper:
     """
     A helper class.
     """
-
     def __init__(self, root: Tree,
                  normalize_func: Callable[[str], str], cutoff: float):
         """
@@ -134,7 +140,7 @@ class FuzzyReplacerHelper:
         :param normalize_func: the function to normalize
         :param cutoff: the difflib cutoff
         """
-        self._root = root
+        self._root: Tree = root
         self._normalize = normalize_func
         self._cutoff = cutoff
         self._states = []
@@ -164,6 +170,9 @@ class FuzzyReplacerHelper:
         cutoff = self._cutoff
 
         def word_matches(chunk: str) -> Optional[float]:
+            """
+            Returns the similarity ratio chunk/word or None
+            """
             s.set_seq1(chunk)
             if (s.real_quick_ratio() >= cutoff
                     and s.quick_ratio() >= cutoff):
@@ -175,21 +184,24 @@ class FuzzyReplacerHelper:
 
         new_states = []
         # try root
-        for k, v in self._root.items():
-            if v is None:
-                self._matches.append(Match(i, i + 1, k, 0))
-            score = word_matches(k)
-            if score:
-                new_states.append(State(i, v, score))
+        for word, subtree in self._root.items():
+            if subtree is None: # word is a leaf, ie a destination word
+                match = Match(i, i + 1, word, 0) # we get a match
+                self._matches.append(match)
+            else:
+                score = word_matches(word)
+                if score:
+                    new_states.append(State(i, subtree, score))
 
         # continue where we left
         for state in self._states:
-            for k, v in state.items():
-                if v is None:
-                    self._matches.append(state.as_match(i, k))
-                score = word_matches(k)
-                if score:
-                    new_states.append(state.update(v, score))
+            for word, subtree in state.items():
+                if subtree is None:
+                    self._matches.append(state.as_match(i, word))
+                else:
+                    score = word_matches(word)
+                    if score:
+                        new_states.append(state.update(subtree, score))
 
         self._states = new_states
 
@@ -198,13 +210,12 @@ class FuzzyReplacer:
     """
     The replacer
     """
-
     def __init__(self, to_by_from: Mapping[str, str],
                  normalize_func: Optional[Callable[[str], str]] = None,
                  cutoff: float = 0.85):
         """
-        :param to_by_from: the mapping
-        :param normalize_func: the function to normalize
+        :param to_by_from: the mapping (replace key by values)
+        :param normalize_func: the function to normalize the keys
         :param cutoff: the difflib cutoff
         """
         if normalize_func is None:
@@ -218,7 +229,7 @@ class FuzzyReplacer:
         :param s: the input string
         :return: the output string, with the matches replaced if possible
         """
-        words_and_spaces = SPLIT_REGEX.split(s)
+        words_and_spaces = SPLIT_W_DELIM_REGEX.split(s)
         if not words_and_spaces:
             return s
         else:
